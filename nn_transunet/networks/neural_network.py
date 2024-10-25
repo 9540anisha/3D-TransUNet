@@ -20,7 +20,7 @@ from torch import nn
 import torch
 from scipy.ndimage.filters import gaussian_filter
 from typing import Union, Tuple, List
-
+import torch.nn.functional as F
 
 class no_op(object):
     def __enter__(self):
@@ -359,6 +359,8 @@ class SegmentationNetwork(NeuralNetwork):
                 gaussian_importance_map = self._get_gaussian(
                     patch_size, sigma_scale=1. / 8)
 
+                if verbose:
+                    print("Gaussian shape = ", gaussian_importance_map.shape)
                 self._gaussian_3d = gaussian_importance_map
                 self._patch_size_for_gaussian_3d = patch_size
             else:
@@ -368,10 +370,12 @@ class SegmentationNetwork(NeuralNetwork):
 
             gaussian_importance_map = torch.from_numpy(gaussian_importance_map).cuda(self.get_device(),
                                                                                      non_blocking=True)
-
+            if verbose:
+                print("Gaussian shape after torch conversion = ", gaussian_importance_map.shape)
         else:
             gaussian_importance_map = None
 
+        # inactive
         if all_in_gpu:
             # If we run the inference in GPU only (meaning all tensors are allocated on the GPU, this reduces
             # CPU-GPU communication but required more GPU memory) we need to preallocate a few things on GPU
@@ -414,6 +418,9 @@ class SegmentationNetwork(NeuralNetwork):
             aggregated_nb_of_predictions = np.zeros(
                 [self.num_classes] + list(data.shape[1:]), dtype=np.float32)
 
+        # steps: [[0, 35, 70], [0, 52], [0, 41]]
+        # data shape: (1, 198, 180, 169)
+        # patch size: [128, 128, 128]
         for x in steps[0]:
             lb_x = x
             ub_x = x + patch_size[0]
@@ -425,8 +432,8 @@ class SegmentationNetwork(NeuralNetwork):
                     ub_z = z + patch_size[2]
 
                     predicted_patch = self._internal_maybe_mirror_and_pred_3D(
-                        data[None, :, lb_x:ub_x, lb_y:ub_y,
-                             lb_z:ub_z], mirror_axes, do_mirroring,
+                        data[None, :, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z],
+                        mirror_axes, do_mirroring,
                         gaussian_importance_map)[0]
 
                     if all_in_gpu:
@@ -434,12 +441,10 @@ class SegmentationNetwork(NeuralNetwork):
                     else:
                         predicted_patch = predicted_patch.cpu().numpy()
 
-                    aggregated_results[:, lb_x:ub_x,
-                                       lb_y:ub_y, lb_z:ub_z] += predicted_patch
-                    aggregated_nb_of_predictions[:, lb_x:ub_x,
-                                                 lb_y:ub_y, lb_z:ub_z] += add_for_nb_of_preds
+                    aggregated_results[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += predicted_patch
+                    aggregated_nb_of_predictions[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += add_for_nb_of_preds
 
-        # we reverse the padding here (remeber that we padded the input to be at least as large as the patch size
+        # we reverse the padding here (remember that we padded the input to be at least as large as the patch size
         slicer = tuple(
             [slice(0, aggregated_results.shape[i]) for i in
              range(len(aggregated_results.shape) - (len(slicer) - 1))] + slicer[1:])
@@ -550,9 +555,28 @@ class SegmentationNetwork(NeuralNetwork):
 
         return predicted_segmentation, predicted_probabilities
 
+
+    def handle_seg_pro(self, seg_pro):
+        mask_cls, mask_pred = seg_pro["pred_logits"], seg_pro["pred_masks"]
+        # ANISHA: shape of pred logits =  torch.Size([1, 20, 3])
+        print("ANISHA: shape of mask_cls = ", mask_cls.shape)
+        # ANISHA: shape of pred masks =  torch.Size([1, 20, 128, 128, 128])
+        print("ANISHA: shape of mask_pred = ", mask_pred.shape)
+        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1] # filter out non-object class
+        mask_pred = mask_pred.sigmoid()
+        seg_pro = torch.einsum("bqc,bqdhw->bcdhw", mask_cls, mask_pred)
+        print("ANISHA: after seg pro generation after einstein sum = ", seg_pro.shape)
+
+        return seg_pro
+
     def _internal_maybe_mirror_and_pred_3D(self, x: Union[np.ndarray, torch.tensor], mirror_axes: tuple,
                                            do_mirroring: bool = True,
                                            mult: np.ndarray or torch.tensor = None) -> torch.tensor:
+
+        print("ANISHA: x type = ", type(x))
+        print("ANISHA: tensor shape = ", x.shape)
+        print("ANISHA: number of classes = ", self.num_classes)
+        print("ANISHA: mirror axes = ", mirror_axes)
         assert len(x.shape) == 5, 'x must be (b, c, x, y, z)'
         # everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
         # we now return a cuda tensor! Not numpy array!
@@ -560,6 +584,8 @@ class SegmentationNetwork(NeuralNetwork):
         x = to_cuda(maybe_to_torch(x), gpu_id=self.get_device())
         result_torch = torch.zeros([1, self.num_classes] + list(x.shape[2:]),
                                    dtype=torch.float).cuda(self.get_device(), non_blocking=True)
+
+        print("ANISHA: result_torch shape = ", result_torch.shape)
 
         if mult is not None:
             mult = to_cuda(maybe_to_torch(mult), gpu_id=self.get_device())
@@ -571,43 +597,87 @@ class SegmentationNetwork(NeuralNetwork):
             mirror_idx = 1
             num_results = 1
 
+        print("ANISHA: mirror_idx = ", range(mirror_idx))
+        # print("X = ", x)
+
+        # borrowed from inference.py
+        # numpy_arr = raw_norm[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z][np.newaxis] \
+        #                   if len(raw_norm.shape)==4 else \
+        #                   raw_norm[lb_x:ub_x, lb_y:ub_y, lb_z:ub_z][np.newaxis, np.newaxis]
+        # tensor_arr = torch.from_numpy(numpy_arr).cuda().half()
+        # seg_pro = net(tensor_arr) # (1, c, d, h, w)
+        # this is the equivalent of self(x)
+        # elif isinstance(seg_pro, dict) and \
+        #                    ('is_max_hungarian' in model_params.keys() and model_params['is_max_hungarian']):
+        #                mask_cls, mask_pred = seg_pro["pred_logits"], seg_pro["pred_masks"]
+        #                # ANISHA: shape of pred logits =  torch.Size([1, 20, 3])
+        #                # ANISHA: shape of pred masks =  torch.Size([1, 20, 128, 128, 128])
+        #                mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1] # filter out non-object class
+        #                mask_pred = mask_pred.sigmoid()
+        #                seg_pro = torch.einsum("bqc,bqdhw->bcdhw", mask_cls, mask_pred)
+        #                _pred = seg_pro
+        #                if args.config.find('500Region') != -1 or  task.find('005') != -1  or task.find('001')  != -1:
+        #                   _pred = seg_pro
+        #               else:
+        #                   _pred = seg_pro * gaussian_mask
+        #
+        #               prob_map[:, :, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += _pred
+        #               # NOTE: should also smooth cnt_map if apply gaussian_mask before |
+        #               #   neural_network.py -> network.predict_3D -> _internal_predict_3D_3Dconv_tiled
+        #               cnt_map[:, :, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += 1
+        #
         for m in range(mirror_idx):
             if m == 0:
-                pred = self.inference_apply_nonlin(self(x)) # self(x) - forward
+                seg_pro = self(x)
+                pred = self.handle_seg_pro(seg_pro)
+                # pred = self.inference_apply_nonlin(self(x)) # self(x) - forward
                 result_torch += 1 / num_results * pred
 
             if m == 1 and (2 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, ))))
+                seg_pro = self(torch.flip(x, (4, )))
+                pred = self.handle_seg_pro(seg_pro)
                 result_torch += 1 / num_results * torch.flip(pred, (4,))
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (4, ))))
 
             if m == 2 and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (3, ))))
+                seg_pro = self(torch.flip(x, (3, )))
+                pred = self.handle_seg_pro(seg_pro)
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (3, ))))
                 result_torch += 1 / num_results * torch.flip(pred, (3,))
 
             if m == 3 and (2 in mirror_axes) and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3))))
+                seg_pro = self(torch.flip(x, (4, 3)))
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3))))
+                pred = self.handle_seg_pro(seg_pro)
                 result_torch += 1 / num_results * torch.flip(pred, (4, 3))
 
             if m == 4 and (0 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (2, ))))
+                seg_pro = self(torch.flip(x, (2, )))
+                pred = self.handle_seg_pro(seg_pro)
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (2, ))))
                 result_torch += 1 / num_results * torch.flip(pred, (2,))
 
             if m == 5 and (0 in mirror_axes) and (2 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 2))))
+                seg_pro = self(torch.flip(x, (4, 2)))
+                pred = self.handle_seg_pro(seg_pro)
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 2))))
                 result_torch += 1 / num_results * torch.flip(pred, (4, 2))
 
             if m == 6 and (0 in mirror_axes) and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (3, 2))))
+                seg_pro = self(torch.flip(x, (3, 2)))
+                pred = self.handle_seg_pro(seg_pro)
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (3, 2))))
                 result_torch += 1 / num_results * torch.flip(pred, (3, 2))
 
             if m == 7 and (0 in mirror_axes) and (1 in mirror_axes) and (2 in mirror_axes):
-                pred = self.inference_apply_nonlin(
-                    self(torch.flip(x, (4, 3, 2))))
+                seg_pro = self(torch.flip(x, (4, 3, 2)))
+                pred = self.handle_seg_pro(seg_pro)
+                # pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3, 2))))
                 result_torch += 1 / num_results * torch.flip(pred, (4, 3, 2))
 
+        # product with guassian mask
         if mult is not None:
             result_torch[:, :] *= mult
-
         return result_torch
 
     def _internal_maybe_mirror_and_pred_2D(self, x: Union[np.ndarray, torch.tensor], mirror_axes: tuple,
