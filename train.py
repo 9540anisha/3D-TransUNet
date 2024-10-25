@@ -26,7 +26,6 @@ from nnunet.run.load_pretrained_weights import load_pretrained_weights
 
 from nn_transunet.default_configuration import get_default_configuration
 
-
 def main():
     parser = argparse.ArgumentParser()
     # change batch_size in nnUNetTrainer.py self.batch_size = stage_plans['batch_size']; can change batch_size=1 if world_size=16
@@ -34,7 +33,7 @@ def main():
     parser.add_argument("--network_trainer", default="nnUNetTrainerV2_DDP")
     parser.add_argument("--task", default="Task801_WORD", help="can be task name or task id")
     parser.add_argument("--task_pretrained", default="Task801_WORD", help="option Task801_WORD, Task850_ABD1K")
-    
+
     parser.add_argument("--fold", help='0, 1, ..., 5 or \'all\'')
     parser.add_argument("--model", default="Generic_UNet", type=str)
     parser.add_argument("--disable_ds", default=False, type=bool)
@@ -67,14 +66,14 @@ def main():
     parser.add_argument("--npz", required=False, default=False, action="store_true", help="if set then nnUNet will "
                                                                                           "export npz files of "
                                                                                           "predicted segmentations "
-                                                                                          "in the vlaidation as well. "
+                                                                                          "in the validation as well. "
                                                                                           "This is needed to run the "
                                                                                           "ensembling step so unless "
                                                                                           "you are developing nnUNet "
                                                                                           "you should enable this")
     parser.add_argument("--valbest", required=False, default=False, action="store_true", help="")
     parser.add_argument("--vallatest", required=False, default=False, action="store_true", help="")
-    
+
     parser.add_argument("--find_lr", required=False, default=False, action="store_true", help="")
     parser.add_argument("--val_folder", required=False, default="validation_raw",
                         help="name of the validation folder. No need to use this for most people")
@@ -110,7 +109,7 @@ def main():
     parser.add_argument('--world-size', default=1, type=int, help='number of nodes for distributed training')
     parser.add_argument('--rank', default=0, type=int, help='node rank for distributed training')
     parser.add_argument('--total_batch_size', default=None, type=int, help='node rank for distributed training')
-    
+
     parser.add_argument('--hdfs_base', default='', type=str)
     parser.add_argument('--optim_name', default='', type=str) # sgd as default, otherwise will have effect in nnUNetTrainerV2_DDP
     parser.add_argument('--lrschedule', default='', type=str) # polylr as default
@@ -140,19 +139,19 @@ def main():
     parser.add_argument("--merge_femur", default=False, action="store_true", help="merge class-15 and class-16 (head of femur) during training")
     parser.add_argument("--is_sigmoid", default=False, action="store_true", help="is_sigmoid for output instead of softmax")
     parser.add_argument('--max_loss_cal', default='', type=str, help="v0, v1")
-    
-    
-    
+
+
+
     # debug
 
     args_config, _ = parser.parse_known_args() # expect return 'remaining' standing for the namspace from launch? but not...
-   
+
     # if args_config.config:
     with open(args_config.config, 'r') as f:
         cfg = yaml.safe_load(f)
         parser.set_defaults(**cfg)
     model_params = cfg.get("model_params", {})
-    
+
     args = parser.parse_args() # update args from yaml
 
     task = args.task
@@ -176,6 +175,8 @@ def main():
     torch.distributed.init_process_group(backend='nccl', init_method='env://')
     args.world_size = torch.distributed.get_world_size()
     args.rank = torch.distributed.get_rank()
+    print("ANISHA: world size = ", args.world_size)
+    print("ANISHA: epochs = ", args.max_num_epochs)
     torch.distributed.barrier()
 
     if fold.startswith('all'):
@@ -183,12 +184,21 @@ def main():
     else:
         fold = int(fold)
 
-
     if not args.hdfs_base:
         args.hdfs_base = network + '_' + args.model
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, trainer_class = get_default_configuration(network, task, network_trainer, plans_identifier, hdfs_base=args.hdfs_base, plan_update=args.plan_update)
+
+    print("ANISHA: plans_file = ", plans_file)
+    print("ANISHA: output_folder_name = ", output_folder_name)
+    print("ANISHA: dataset_directory = ", dataset_directory)
+    print("ANISHA: batch_dice = ", batch_dice)
+    print("ANISHA: stage = ", stage)
+    print("ANISHA: hdfs_base = ", args.hdfs_base)
+    print("ANISHA: trainer_class = ", trainer_class)
     resolution_index = 1
 
+    print("ANISHA: dataset_directory from default_configuration =", dataset_directory)
+    print("ANISHA: args.config = ", args.config)
     if args.config.find('500Region') != -1:
         batch_dice = True
         resolution_index = 0
@@ -196,6 +206,7 @@ def main():
     if '005' in plans_file or '004' in plans_file or '002' in plans_file or '001' in plans_file:
         resolution_index = 0
 
+    resolution_index = 0
     info = pickle.load(open(plans_file, "rb"))
     plan_data = {}
     plan_data["plans"] = info
@@ -206,7 +217,7 @@ def main():
     if trainer_class is None:
         raise RuntimeError("Could not find trainer class in meddec.model_training")
 
-    if args.pretrained: 
+    if args.pretrained:
         fold_name = 'all' if isinstance(fold, str) and fold.startswith('all') else 'fold_'+str(fold)
         init_ckpt_base = model_params['init_ckpt']
 
@@ -233,7 +244,7 @@ def main():
     trainer = trainer_class(plans_file, fold, local_rank=args.local_rank, output_folder=output_folder_name,
                             dataset_directory=dataset_directory, batch_dice=batch_dice, stage=stage,
                             unpack_data=decompress_data, deterministic=deterministic, fp16=not fp32,
-                            distribute_batch_size=args.dbs, 
+                            distribute_batch_size=args.dbs,
                             # model=args.model, disable_ds=args.disable_ds, resume=args.resume,
                             input_size=args.crop_size,
                             args=args) # for V2
@@ -261,7 +272,7 @@ def main():
             else:
                 # new training without pretraine weights, do nothing
                 pass
-            
+
             if args.resume == 'auto':
                 fold_name = fold if isinstance(fold, str) and fold.startswith('all') else 'fold_'+str(fold)
                 output_folder =  output_folder_name + '/' + fold_name
@@ -274,7 +285,9 @@ def main():
                 resume = ckpt_path if os.path.exists(ckpt_path) else False # set resume flag for every process
                 if resume: # will find ckpt_path (find 1. best 2. final 3. latest) in network_trainer
                     print("### resume, load_latest_checkpoint")
-                    trainer.load_latest_checkpoint() # load ckpt, opt, amp, epoch, plot.... check network_trainer.load_latest_checkpoint(), which will call nnUNetTrainerV2_DDP.load_checkpoint_ram()
+                    # load ckpt, opt, amp, epoch, plot.... check network_trainer.load_latest_checkpoint(),
+                    #  which will call nnUNetTrainerV2_DDP.load_checkpoint_ram()
+                    trainer.load_latest_checkpoint()
                     resume_epoch = trainer.epoch
             elif args.resume == 'local_latest':
                 fold_name = fold if isinstance(fold, str) and fold.startswith('all') else 'fold_'+str(fold)
@@ -285,14 +298,15 @@ def main():
                 ckpt_path = output_folder +  "/model_latest.model" # check network_trainer.load_latest_checkpoint()
                 resume = ckpt_path if os.path.exists(ckpt_path) else False # set resume flag for every process
 
-                if resume: # will find ckpt_path (find 1. best 2. final 3. latest) in network_trainer
+                # will find ckpt_path (find 1. best 2. final 3. latest) in network_trainer
+                if resume:
                     print("### resume, load_latest_checkpoint")
-                    trainer.load_latest_checkpoint() # load ckpt, opt, amp, epoch, plot.... check network_trainer.load_latest_checkpoint(), which will call nnUNetTrainerV2_DDP.load_checkpoint_ram()
+                    # load ckpt, opt, amp, epoch, plot.... check network_trainer.load_latest_checkpoint(),
+                    # which will call nnUNetTrainerV2_DDP.load_checkpoint_ram()
+                    trainer.load_latest_checkpoint()
                     resume_epoch = trainer.epoch
             trainer.run_training()
-            
         else:
-            
             if valbest:
                 trainer.load_best_checkpoint(train=False)
             elif vallatest:
@@ -306,16 +320,14 @@ def main():
         if args.val_final or vallatest:
             trainer.validate(save_softmax=args.npz, validation_folder_name=val_folder,
                          run_postprocessing_on_folds=not disable_postprocessing_on_folds)
-        
 
         if network == '3d_lowres':
             raise NotImplementedError
-    
+
     # torch.distributed.barrier()
-    
+
     print("######### run_training_DDP done!")
     # torch.distributed.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
