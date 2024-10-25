@@ -18,6 +18,7 @@
 from genericpath import exists
 import os
 import shutil
+import traceback
 from _warnings import warn
 from collections import OrderedDict
 from multiprocessing import Pool
@@ -41,6 +42,7 @@ from torch import nn, distributed
 from torch.backends import cudnn
 from torch.cuda.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn import DataParallel as DP
 from torch.optim.lr_scheduler import _LRScheduler
 import torch.nn.functional as F
 from tqdm import trange
@@ -59,14 +61,11 @@ from ..data.default_data_augmentation import default_2D_augmentation_params, get
 from ..networks.transunet3d_model import Generic_TransUNet_max_ppbp
 
 
-
-
-
 class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
     def __init__(self, plans_file, fold, local_rank, output_folder=None, dataset_directory=None, batch_dice=True,
                  stage=None,
-                 unpack_data=True, deterministic=True, distribute_batch_size=False, fp16=False, 
-                 model="Generic_UNet", 
+                 unpack_data=True, deterministic=True, distribute_batch_size=False, fp16=False,
+                 model="Generic_UNet",
                  input_size=(64, 160, 160),
                  args=None):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage,
@@ -76,6 +75,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             deterministic, distribute_batch_size, fp16)
         assert args is not None
         self.args = args
+        # inactive for Atlas
         if self.args.config.find('500Region') != -1:
             self.regions = {"whole tumor": (1, 2, 3),
                             "tumor core": (2, 3),
@@ -87,7 +87,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                                 "enhancing tumor": (2,) # fig 1: the innermost tumor, but this is a bug!!
                                 }
             self.regions_class_order = (1, 2, 3)
-        
+
 
         self.layer_decay = args.layer_decay
         self.lr_scheduler_name = args.lrschedule # [ TO DO ]
@@ -99,8 +99,6 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             self.model_params = args.model_params
         else:
             self.model_params = {}
-        
-
 
         self.optim_name = args.optim_name
         self.find_zero_weight_decay = args.find_zero_weight_decay
@@ -123,12 +121,11 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
-        
+
         # dist.init_process_group(backend='nccl', init_method='env://') # init outside
 
         self.loss = None
         self.ce_loss = RobustCrossEntropyLoss()
-
         self.global_batch_size = None  # we need to know this to properly steer oversample
 
     def setup_DA_params_BraTSRegions(self):
@@ -204,16 +201,19 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             # reset the batch_size per gpu accordingly
             self.batch_size = self.args.total_batch_size // world_size
 
-        
         # if self.args.local_rank == 0:
-        #     print("total_batch_size: %d, updated batch_size per gpu %d, world_size %d" % (self.args.total_batch_size, self.batch_size, world_size))
+        #     print("total_batch_size: %d, updated batch_size per gpu %d, world_size %d" %
+        #         (self.args.total_batch_size, self.batch_size, world_size))
         if self.distribute_batch_size: # set total batch_size to 16 will be fine...
             self.global_batch_size = self.batch_size
         else:
             self.global_batch_size = self.batch_size * world_size
 
         batch_size_per_GPU = np.ceil(self.batch_size / world_size).astype(int)  # probably 1
-        
+
+        print("ANISHA: batch_size_per_GPU = ", batch_size_per_GPU)
+        print("ANISHA: batch_size = ", self.batch_size)
+
         for rank in range(world_size):
             if self.distribute_batch_size:
                 if (rank + 1) * batch_size_per_GPU > self.batch_size:
@@ -223,6 +223,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             else:
                 batch_size = self.batch_size
 
+            print("ANISHA: rank = ", rank)
+            print("ANISHA: my_rank = ", my_rank)
+            print("ANISHA: batch_size computed = ", batch_size)
             batch_sizes.append(batch_size)
 
             sample_id_low = 0 if len(batch_sizes) == 0 else np.sum(batch_sizes[:-1])
@@ -241,7 +244,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         print("worker", my_rank, "oversample", oversample_percents[my_rank])
         print("worker", my_rank, "batch_size", batch_sizes[my_rank])
         # batch_sizes [self.batch_size]*world_size
-        self.batch_size = batch_sizes[my_rank] 
+        self.batch_size = batch_sizes[my_rank]
         self.oversample_foreground_percent = oversample_percents[my_rank]
 
     def save_checkpoint(self, fname, save_optimizer=True):
@@ -260,7 +263,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         super().process_plans(plans)
         if (self.patch_size != self.args.crop_size).any():
             self.patch_size = self.args.crop_size
-        
+
         self.set_batch_size_and_oversample()
 
         if self.args.config.find('500Region') != -1:
@@ -281,15 +284,16 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
             self.setup_DA_params()
 
+            # inactive for Atlas
             if self.args.config.find('500Region') != -1: # BraTSRegions_moreDA
                 self.setup_DA_params_BraTSRegions()
 
-            
             if hasattr(self.args, 'deep_supervision_scales') and len(self.args.deep_supervision_scales)>0:
                 self.deep_supervision_scales = self.args.deep_supervision_scales # overwrite setup_DA_params() from nnUNetTrainerV2
-            
+            else:
+                print("ANISHA: deep supervision scales is OFF")
 
-            self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] + 
+            self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] +
                                                     "_stage%d" % self.stage)
             if training:
                 self.dl_tr, self.dl_val = self.get_basic_generators()
@@ -311,6 +315,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     net_numpool = len(self.deep_supervision_scales)
                 else:
                     net_numpool = len(self.net_num_pool_op_kernel_sizes)
+                    print("ANISHA: net_numpool for kernel sizes = ", net_numpool)
 
                 # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
                 # this gives higher resolution outputs more weight in the loss
@@ -335,7 +340,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     lb, ub, means, stds = self.reclip[0], self.reclip[1], self.intensity_properties[0]['mean'], self.intensity_properties[0]['sd']
                     self.reclip = [lb, ub, means, stds]
 
-
+                # inactive for Atlas
                 if self.args.config.find('500Region') != -1: # BraTSRegions_moreDA
                     from nnunet.training.data_augmentation.data_augmentation_insaneDA2 import get_insaneDA_augmentation2
                     self.tr_gen, self.val_gen = get_insaneDA_augmentation2(
@@ -349,23 +354,23 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                                                 ) # such that we can get val
                 else:
                     self.tr_gen, self.val_gen = get_moreDA_augmentation(
-                                                self.dl_tr, self.dl_val,
-                                                    self.data_aug_params[
-                                                        'patch_size_for_spatialtransform'],
-                                                    self.data_aug_params,
-                                                    deep_supervision_scales=self.deep_supervision_scales,
-                                                    seeds_train=seeds_train,
-                                                    seeds_val=seeds_val,
-                                                    pin_memory=self.pin_memory,
-                                                    is_spatial_aug_only=self.is_spatial_aug_only,
-                                                    reclip=self.reclip
-                                                )
-                
+                            self.dl_tr, self.dl_val,
+                            self.data_aug_params[
+                                'patch_size_for_spatialtransform'],
+                            self.data_aug_params,
+                            deep_supervision_scales=self.deep_supervision_scales,
+                            seeds_train=seeds_train,
+                            seeds_val=seeds_val,
+                            pin_memory=self.pin_memory,
+                            is_spatial_aug_only=self.is_spatial_aug_only,
+                            reclip=self.reclip
+                        )
+
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
                 # in network_trainer.py tr_keys = val_keys = list(self.dataset.keys()) if fold=='all'
                 self.print_to_log_file("VALIDATION KEYS:\n %s" % (str(self.dataset_val.keys())),
-                                       also_print_to_console=False) 
+                                       also_print_to_console=False)
             else:
                 pass
 
@@ -389,7 +394,6 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         Known issue: forgot to set neg_slope=0 in InitWeights_He; should not make a difference though
         :return:
         """
-
         if self.model.startswith("Generic"):
             if self.threeD:
                 conv_op = nn.Conv3d
@@ -406,26 +410,26 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             net_nonlin = nn.LeakyReLU # nnunet v1, not softmax..., interesting..., but compute_loss has consider the softmax..
             net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
             do_ds = not self.disable_ds
-            if not do_ds: print("disable ds")
+            if not do_ds:
+                print("disable ds")
 
+            # active for Atlas
             if self.model == 'Generic_TransUNet_max_ppbp':
+                print("ANISHA: creating model for Generic_TransUNet_max_ppbp")
                 self.network = Generic_TransUNet_max_ppbp(self.num_input_channels, self.base_num_features, self.num_classes,
                                     len(self.net_num_pool_op_kernel_sizes),
                                     self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
                                     dropout_op_kwargs,
                                     net_nonlin, net_nonlin_kwargs, do_ds, False, lambda x: x, InitWeights_He(1e-2),
-                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, 
-                                    convolutional_upsampling= False if ('is_fam' in self.model_params.keys() and self.model_params['is_fam']) else True, #  default True,
-                                    patch_size=self.args.crop_size, 
+                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True,
+                                    convolutional_upsampling= False if ('is_fam' in self.model_params.keys()
+                                             and self.model_params['is_fam']) else True, #  default True,
+                                    patch_size=self.args.crop_size,
                                     **self.model_params)
-                
 
-            
             self.network.inference_apply_nonlin = nn.Sigmoid() if self.model == 'Generic_UNet_large' else softmax_helper
-
-
+            # self.network.inference_apply_nonlin = nn.Sigmoid()
         else:
-
             raise NotImplementedError
 
         total = sum([param.nelement() for param in self.network.parameters()])
@@ -433,7 +437,6 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         # assert 1==2, self.network
         if torch.cuda.is_available():
             self.network.cuda()
-
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
@@ -448,7 +451,8 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         if self.lr_scheduler_name == 'warmup_cosine':
             print("initialized lr_scheduler ", self.lr_scheduler_name)
             from ..optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-            self.lr_scheduler = LinearWarmupCosineAnnealingLR(self.optimizer, warmup_epochs=self.warmup_epochs, max_epochs=self.max_num_epochs, eta_min=self.min_lr)
+            self.lr_scheduler = LinearWarmupCosineAnnealingLR(self.optimizer, warmup_epochs=self.warmup_epochs,
+                    max_epochs=self.max_num_epochs, eta_min=self.min_lr)
         else:
             self.lr_scheduler = None
 
@@ -466,7 +470,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             ep = self.epoch + 1
         else:
             ep = epoch
-        
+
         if self.lr_scheduler is not None:
             from torch.optim import lr_scheduler
             # LinearWarmupCosineAnnealingLR inherit _LRScheduler
@@ -479,7 +483,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             else:
                 # print("maybe_update_lr(): update lr through lr_scheduler for self.epoch+1")
                 self.lr_scheduler.step(self.epoch + 1)
-            
+
         else:
             if self.warmup_epochs is not None:
                 from network_trainer import warmup_poly_lr
@@ -488,7 +492,6 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 from network_trainer import poly_lr
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
         self.print_to_log_file("lr:", np.round(self.optimizer.param_groups[0]['lr'], decimals=6))
-
 
     def on_after_backward(self):
         # added by jieneng: https://github.com/PyTorchLightning/pytorch-lightning/issues/4956
@@ -502,11 +505,14 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         if not valid_gradients:
             self.optimizer.zero_grad()
 
-
     def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
+        print("ANISHA: type of data_generator = ", type(data_generator))
         data_dict = next(data_generator)
         data = data_dict['data']
         target = data_dict['target']
+        print("ANISHA: data generator data = ", data[0].shape, data[1].shape)
+        print("ANISHA: data generator target = ", target[0].shape, target[1].shape,
+             target[2].shape, target[3].shape, target[4].shape)
 
         if self.args.merge_femur:
             target[target==16] = 15
@@ -514,16 +520,18 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         data = maybe_to_torch(data)
         target = maybe_to_torch(target)
 
+        print("ANISHA: after conversion to torch, the type of data = ", type(data), data.shape)
         if torch.cuda.is_available():
             data = to_cuda(data, gpu_id=None)
             target = to_cuda(target, gpu_id=None)
 
         self.optimizer.zero_grad()
 
-
         if self.fp16:
+            print("ANISHA: using fp16")
             with torch.autograd.set_detect_anomaly(True):
                 with autocast():
+                    cl_start_time = time()
                     is_c2f = self.args.model.find('C2F') != -1
                     is_max = self.args.model_params.get('is_max', self.args.model.find('max') != -1)
                     is_max_hungarian = ('is_max_hungarian' in self.args.model_params.keys() and self.args.model_params['is_max_hungarian'])
@@ -535,36 +543,53 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
                     if is_c2f:
                         output = self.network(data, target[0] if is_c2f else None)
+                        cl_end_time = time()
                     else:
                         output = self.network(data) # transunet output [2, 17, 64, 160, 160]
+                        cl_end_time = time()
                     del data
-                    if is_max and not ('is_masking_argmax' in self.args.model_params.keys() and self.args.model_params['is_masking_argmax']):
+                    if is_max and not ('is_masking_argmax' in self.args.model_params.keys() and
+                            self.args.model_params['is_masking_argmax']):
+                        print("ANISHA: is_sigmoid is set to true")
                         self.args.is_sigmoid = True
-                    
+
                     if self.disable_ds:
+                        print("ANISHA: disable_ds is ON")
                         if not (is_max or is_c2f):
                             if isinstance(output, (tuple, list)):
                                 output = output[0]
                         if isinstance(target, (tuple, list)):
                             target = target[0]
+                    else:
+                        print("ANISHA: disable_ds is OFF")
 
-
-                    l = self.compute_loss(output, target, is_max, is_c2f, self.args.is_sigmoid, is_max_hungarian, is_max_ds, point_rend, num_point_rend, no_object_weight)
+                    cl_start_time = time()
+                    l = self.compute_loss(output, target, is_max, is_c2f, self.args.is_sigmoid,
+                                is_max_hungarian, is_max_ds, point_rend, num_point_rend, no_object_weight)
+                    cl_end_time = time()
+                    print("ANISHA: compute loss time: ", (cl_end_time - cl_start_time))
 
                 if do_backprop:
+                    cl_start_time = time()
                     self.amp_grad_scaler.scale(l).backward()
+                    cl_end_time = time()
+                    print("ANISHA: backward time: ", (cl_end_time - cl_start_time))
+
                     """
                     for name, param in self.network.named_parameters():
                         if param.grad is None:
                             print("unused paramter found in ", name)
                     """
+
+                    cl_start_time = time()
                     self.amp_grad_scaler.unscale_(self.optimizer)
+                    cl_end_time = time()
+                    print("ANISHA: optimizer time: ", (cl_end_time - cl_start_time))
                     if self.args.skip_grad_nan:
                         self.on_after_backward()
                     torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
                     self.amp_grad_scaler.step(self.optimizer)
                     self.amp_grad_scaler.update()
-            
         else:
             output = self.network(data)
             del data
@@ -575,7 +600,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 # self.on_after_backward()
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
                 self.optimizer.step()
-        
+
         if run_online_evaluation:
             with torch.no_grad():
                 self.run_online_evaluation(output, target) # compute dice for train sample?
@@ -584,29 +609,37 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
         return l.detach().cpu().numpy()
 
-    def compute_loss(self, output, target, is_max=False, is_c2f=False, is_sigmoid=False, is_max_hungarian=False, is_max_ds=False, point_rend=False, num_point_rend=None, no_object_weight=None):
+    def compute_loss(self, output, target, is_max=False, is_c2f=False,
+            is_sigmoid=False, is_max_hungarian=False, is_max_ds=False,
+            point_rend=False, num_point_rend=None, no_object_weight=None):
         total_loss, smooth, do_fg = None, 1e-5, False
+        # inactive for Atlas
         if self.args.config.find('500Region') != -1:
             assert is_sigmoid, "BraTS region should be compatible with sigmoid activation"
             smooth = 0
             do_fg = True
-        
+
+        # active for Atlas
         if isinstance(output, (tuple, list, dict)):
             len_ds = 1+len(output['aux_outputs']) if isinstance(output, dict) else len(output)
+            # inactive for Atlas
             if self.args.max_loss_cal == 'exp': # for max_ds or ds
                 max_ds_loss_weights = np.array([1 / (2 ** i) for i in range(len_ds)])
                 max_ds_loss_weights = max_ds_loss_weights / max_ds_loss_weights.sum()
             else:
                 max_ds_loss_weights = [1] * (len_ds) # previous had a bug with exp weight for 'v0' ..
 
+        # active for Atlas
         if is_max and is_max_hungarian:
             # output: a dict of ['pred_logits', 'pred_masks', 'aux_outputs']
+            # inactive for Atlas
             if not self.disable_ds:
                 output_ds, target_ds = output[1:], target[1:]
                 output, target = output[0], target[0]
 
             aux_outputs = output['aux_outputs'] # a list of dicts of ['pred_logits', 'pred_masks']
-            
+
+            # inactive for Atlas
             if self.args.config.find('500Region') != -1:
                 target_onehot = target
             else:
@@ -632,11 +665,18 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 )
             outputs_without_aux = {k: v for k, v in output.items() if k != "aux_outputs"}
             loss_list = []
-            loss_final = compute_loss_hungarian(outputs_without_aux, targets, 0, matcher, self.num_classes, point_rend, num_point_rend, no_object_weight=no_object_weight, cost_weight=self.cost_weight)
+            loss_final = compute_loss_hungarian(
+                    outputs_without_aux, targets, 0,
+                    matcher, self.num_classes,
+                    point_rend, num_point_rend,
+                    no_object_weight=no_object_weight,
+                    cost_weight=self.cost_weight)
             loss_list.append(max_ds_loss_weights[0] * loss_final)
             if is_max_ds and "aux_outputs" in output:
                 for i, aux_outputs in enumerate(output["aux_outputs"][::-1]): # reverse order
-                    loss_aux = compute_loss_hungarian(aux_outputs, targets, i+1, matcher, self.num_classes, point_rend, num_point_rend, no_object_weight=no_object_weight, cost_weight=self.cost_weight)
+                    loss_aux = compute_loss_hungarian(aux_outputs, targets, i+1, matcher, self.num_classes,
+                            point_rend, num_point_rend, no_object_weight=no_object_weight,
+                            cost_weight=self.cost_weight)
                     loss_list.append(max_ds_loss_weights[i+1] *loss_aux)
             else:
                 return loss_final
@@ -647,7 +687,8 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 total_loss = (loss_list[0] + sum(loss_list[1:])/len(loss_list[1:])) / 2
             elif self.args.max_loss_cal in ['v0', 'exp']:
                 total_loss = sum(loss_list) # weighted with 1.0 or exp
-            
+
+            # inactive for Atlas
             if not self.disable_ds:
                 total_loss = self.ds_loss_weights[0] * total_loss # replace with loss from Transformer decoder
                 # print("i {} loss {}".format(0, total_loss))
@@ -657,7 +698,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     with autocast(enabled=False):
                         output_act = output_ds[i].sigmoid() if is_sigmoid else softmax_helper(output_ds[i]) # bug occurs here..
                     tp, fp, fn, _ = get_tp_fp_fn_tn(output_act, target_ds[i], axes, mask=None) # target_ds[i] is one-hot, tp: (b, n_class)
-                    if do_fg: # 
+                    if do_fg: #
                         nominator = 2 * tp # already fg
                         denominator = 2 * tp + fp + fn
                     else:
@@ -670,7 +711,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                         denominator = awesome_allgather_function.apply(denominator)
                         nominator = nominator.sum(0)
                         denominator = denominator.sum(0)
-                    
+
                     dice_loss = (- (nominator + smooth) / (denominator + smooth)).mean()
 
                     if is_sigmoid:
@@ -683,7 +724,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                         ce_loss = F.binary_cross_entropy_with_logits(output_ds[i], target_onehot)
                     else:
                         ce_loss = self.ce_loss(output_ds[i], target_ds[i][:, 0].long())
-                    
+
                     # print("i {} loss {}".format(i+1, self.ds_loss_weights[i+1] * (ce_loss + dice_loss) ))
                     total_loss += self.ds_loss_weights[i+1] * (0.5*ce_loss + 0.5*dice_loss) # NOTE: weight shift..
 
@@ -729,10 +770,10 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     total_loss = cur_loss
                 else:
                     total_loss += cur_loss
-                
+
                 if i==0:
                     final_loss = (ce_loss + dice_loss)
-            
+
             # should have a self.ds_loss_weights for max?
             if self.args.max_loss_cal == '':
                 total_loss /= len(output)
@@ -771,7 +812,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 denominator = denominator.sum(0)
             else:
                 pass
-            
+
             if is_sigmoid:
                 target_onehot = torch.zeros_like(output, device=output.device)
                 target_onehot.scatter_(1, target.long(), 1)
@@ -795,13 +836,13 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 tp, fp, fn, _ = get_tp_fp_fn_tn(output_act, target[i], axes, mask=None)
                 # for dice, compute nominator and denominator so that we have to accumulate only 2 instead of 3 variables
                 # do_bg=False in nnUNetTrainer -> [:, 1:]
-                if do_fg: # 
+                if do_fg: #
                     nominator = 2 * tp # already fg
                     denominator = 2 * tp + fp + fn
                 else:
                     nominator = 2 * tp[:, 1:] # do fg
                     denominator = 2 * tp[:, 1:] + fp[:, 1:] + fn[:, 1:]
-                
+
                 if self.batch_dice:
                     # for DDP we need to gather all nominator and denominator terms from all GPUS to do proper batch dice
                     nominator = awesome_allgather_function.apply(nominator)
@@ -828,7 +869,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 else:
                     total_loss += self.ds_loss_weights[i] * (ce_loss + dice_loss)
             return total_loss
-        
+
     def run_online_evaluation(self, output, target):
         if self.disable_ds:
             if ('is_max_hungarian' in self.args.model_params.keys() and self.args.model_params['is_max_hungarian']):
@@ -866,10 +907,10 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                         for q in range(20):
                             cur_cls = mask_cls_b_idx[q]
                             mask_pred_q[b][q][mask_pred_hard[b][q]==1] = cur_cls+1
-                            
+
                         for i in range(self.num_classes):
                             mask_cls_b_max_i = mask_cls_b_max[mask_cls_b_idx==i] # (s) for each gt class, there might be several queries which are most likely to the class
-                            
+
                             if len(mask_cls_b_max_i) > 0:
                                 mask_cls_b_max_i_maxq, mask_cls_b_max_i_idxq = torch.max(mask_cls_b_max_i, dim=-1) # select one most likely query
                                 segm[b, i] = mask_pred[b][mask_cls_b_max_i_idxq]
@@ -885,7 +926,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                             pred = mask_pred_q[0, i].cpu().numpy()
                             pred_sitk = sitk.GetImageFromArray(pred.astype(np.uint8))
                             sitk.WriteImage(pred_sitk, os.path.join(viz_output_folder, str(i)+'_pred.nii.gz'))
-                        
+
                         targ_hot = target[0][0] # (3, d, h, w)
                         targ = torch.zeros(targ_hot.shape[1:]).to(targ_hot.device)
                         for kk in range(3):
@@ -902,7 +943,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     mask_cls, mask_pred = output[0]["pred_logits"], output[0]["pred_masks"]
                     mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1] # filter out non-object class
                     mask_pred = mask_pred.sigmoid()
-                    output[0] = torch.einsum("bqc,bqdhw->bcdhw", mask_cls, mask_pred) # replace 
+                    output[0] = torch.einsum("bqc,bqdhw->bcdhw", mask_cls, mask_pred) # replace
 
 
         if self.args.config.find('500Region') != -1: # only care about foreground
@@ -986,7 +1027,8 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             self.save_debug_information()
 
         if not torch.cuda.is_available():
-            self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU (torch.cuda.is_available() is False). This can be VERY slow!")
+            self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU " \
+                "(torch.cuda.is_available() is False). This can be VERY slow!")
 
         self.maybe_update_lr(self.epoch)  # if we dont overwrite epoch then self.epoch+1 is used which is not what we
         # want at the start of the training
@@ -1024,7 +1066,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
             # train one epoch
             self.network.train()
-            
+
             if self.use_progress_bar:
                 with trange(self.num_batches_per_epoch) as tbar:
                     for b in tbar:
@@ -1064,8 +1106,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
             self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
 
-            continue_training = self.on_epoch_end() # network_trainer: plot_progress() maybe_update_lr(self.epoch) maybe_save_checkpoint() update_eval_criterion_MA()
-            
+            # network_trainer: plot_progress() maybe_update_lr(self.epoch) maybe_save_checkpoint() update_eval_criterion_MA()
+            continue_training = self.on_epoch_end()
+
             torch.distributed.barrier()
             if self.resume == 'auto':
                 from ..utils.dist_utils import check_call_hdfs_command, mkdir_hdfs
@@ -1083,9 +1126,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     put_cmd = f"-put -f {local_best_path} {hdfs_path}"
                     check_call_hdfs_command(put_cmd)
 
-            
             epoch_end_time = time()
-
             if not continue_training:
                 # allows for early stopping
                 break
@@ -1095,7 +1136,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
         self.epoch -= 1  # if we don't do this we can get a problem with loading model_final_checkpoint.
 
-        if self.save_final_checkpoint: 
+        if self.save_final_checkpoint:
             if self.local_rank==0: print("saving final...")
             self.save_checkpoint(join(self.output_folder, "model_final_checkpoint.model"))
 
@@ -1106,9 +1147,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         net.do_ds = ds
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
-                 step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
-                 validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
+            step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+            validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
+            segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
         if isinstance(self.network, DDP):
             net = self.network.module
         else:
@@ -1142,17 +1183,18 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         output_folder = join(self.output_folder, validation_folder_name)
         maybe_mkdir_p(output_folder)
         # this is for debug purposes
-        my_input_args = {'do_mirroring': do_mirroring,
-                         'use_sliding_window': use_sliding_window,
-                         'step_size': step_size,
-                         'save_softmax': save_softmax,
-                         'use_gaussian': use_gaussian,
-                         'overwrite': overwrite,
-                         'validation_folder_name': validation_folder_name,
-                         'debug': debug,
-                         'all_in_gpu': all_in_gpu,
-                         'segmentation_export_kwargs': segmentation_export_kwargs,
-                         }
+        my_input_args = {
+                'do_mirroring': do_mirroring,
+                'use_sliding_window': use_sliding_window,
+                'step_size': step_size,
+                'save_softmax': save_softmax,
+                'use_gaussian': use_gaussian,
+                'overwrite': overwrite,
+                'validation_folder_name': validation_folder_name,
+                'debug': debug,
+                'all_in_gpu': all_in_gpu,
+                'segmentation_export_kwargs': segmentation_export_kwargs,
+            }
         save_json(my_input_args, join(output_folder, "validation_args.json"))
 
         if do_mirroring:
@@ -1180,19 +1222,21 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             if k in my_keys:
                 if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
                         (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
+                    print("ANISHA: for this image this file will be loaded: ", self.dataset[k]['data_file'])
                     data = np.load(self.dataset[k]['data_file'])['data']
 
-                    print(k, data.shape)
+                    print("ANISHA: k and data_shape =", k, data.shape)
                     data[-1][data[-1] == -1] = 0
 
-                    softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
-                                                                                         do_mirroring=do_mirroring,
-                                                                                         mirror_axes=mirror_axes,
-                                                                                         use_sliding_window=use_sliding_window,
-                                                                                         step_size=step_size,
-                                                                                         use_gaussian=use_gaussian,
-                                                                                         all_in_gpu=all_in_gpu,
-                                                                                         mixed_precision=self.fp16)[1]
+                    softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(
+                            data[:-1],
+                            do_mirroring=do_mirroring,
+                            mirror_axes=mirror_axes,
+                            use_sliding_window=use_sliding_window,
+                            step_size=step_size,
+                            use_gaussian=use_gaussian,
+                            all_in_gpu=all_in_gpu,
+                            mixed_precision=self.fp16)[1]
 
                     softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
 
@@ -1307,8 +1351,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                                 use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
                                 pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
                                 mixed_precision=mixed_precision)
-        except:
-            print("run?")
+        except Exception as e:
+            print("run? : ", e)
+            print(traceback.format_exc())
         net.do_ds = ds
         return ret
 
@@ -1347,7 +1392,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         self.epoch = checkpoint['epoch']
         if train:
             optimizer_state_dict = checkpoint['optimizer_state_dict']
-            
+
             if optimizer_state_dict is not None:
                 print("optimizer_state_dict loaded")
                 self.optimizer.load_state_dict(optimizer_state_dict)
@@ -1366,7 +1411,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         # after the training is done, the epoch is incremented one more time in my old code. This results in
         # self.epoch = 1001 for old trained models when the epoch is actually 1000. This causes issues because
         # len(self.all_tr_losses) = 1000 and the plot function will fail. We can easily detect and correct that here
-        
+
         if self.epoch != len(self.all_tr_losses):
             self.print_to_log_file("WARNING in loading checkpoint: self.epoch != len(self.all_tr_losses). This is "
                                    "due to an old bug and should only appear when you are loading old models. New "
@@ -1379,7 +1424,6 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
 
     def on_epoch_end(self):
-
         # appear in nnUNetTrainer, accumulate "Average global foreground Dice:" from results in self.run_online_evaluation
         # to update all_val_eval_metrics, which can update val_eval_criterion_MA to update best_val_eval_criterion_MA
         # and then save_best_checkpoint; so the model_best is the best results of self.val_gen

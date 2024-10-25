@@ -128,6 +128,7 @@ class NetworkTrainer(object):
         self.train_loss_MA_alpha = 0.93  # alpha * old + (1-alpha) * new
         self.train_loss_MA_eps = 5e-4  # new MA must be at least this much better (smaller)
         self.max_num_epochs = 1000
+        # self.num_batches_per_epoch = 125
         self.num_batches_per_epoch = 250
         self.num_val_batches_per_epoch = 50
         self.also_val_in_tr_mode = False
@@ -532,7 +533,6 @@ class NetworkTrainer(object):
 
             epoch_end_time = time()
 
-            
             if self.resume == 'auto':
                 from ..utils.dist_utils import check_call_hdfs_command, mkdir_hdfs
                 hdfs_folder=self.output_folder.replace("/opt/tiger/project/data/nnUNet_trained_models/UNet_IN_NANFang/", "") # with fold
@@ -585,7 +585,8 @@ class NetworkTrainer(object):
 
     def update_eval_criterion_MA(self):
         """
-        If self.all_val_eval_metrics is unused (len=0) then we fall back to using -self.all_val_losses for the MA to determine early stopping
+        If self.all_val_eval_metrics is unused (len=0) then we fall back 
+        to using -self.all_val_losses for the MA to determine early stopping
         (not a minimization, but a maximization of a metric and therefore the - in the latter case)
         :return:
         """
@@ -632,7 +633,8 @@ class NetworkTrainer(object):
             if self.val_eval_criterion_MA > self.best_val_eval_criterion_MA:
                 self.best_val_eval_criterion_MA = self.val_eval_criterion_MA
                 # self.print_to_log_file("saving best epoch checkpoint...")
-                if self.save_best_checkpoint: self.save_checkpoint(join(self.output_folder, "model_best.model"))
+                if self.save_best_checkpoint:
+                    self.save_checkpoint(join(self.output_folder, "model_best.model"))
 
             # Now see if the moving average of the train loss has improved. If yes then reset patience, else
             # increase patience

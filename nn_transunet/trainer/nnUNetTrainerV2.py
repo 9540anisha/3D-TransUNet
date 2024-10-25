@@ -133,7 +133,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
                 
                 self.ds_loss_weights[0]=1
                 self.ds_loss_weights[1:]=0
-                from loss_functions import DC_and_CE_loss
+                from ..trainer.loss_functions import DC_and_CE_loss
                 self.loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {})
 
             else:

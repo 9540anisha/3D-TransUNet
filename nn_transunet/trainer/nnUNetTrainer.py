@@ -370,6 +370,8 @@ class nnUNetTrainer(NetworkTrainer):
 
         stage_plans = self.plans['plans_per_stage'][self.stage]
         self.batch_size = stage_plans['batch_size']
+
+        print("ANISHA: batch size is being read from stage_plans =" , self.batch_size)
         # self.batch_size = 4
         self.net_pool_per_axis = stage_plans['num_pool_per_axis']
         self.patch_size = np.array(stage_plans['patch_size']).astype(int)
